@@ -1,0 +1,8 @@
+name: docx2md
+description: Convert Word documents (.docx) to AI-readable Markdown
+tags:
+  - document
+  - conversion
+  - markdown
+  - docx
+input_placeholder: "document.docx"
