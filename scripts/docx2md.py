@@ -140,10 +140,11 @@ def extract_xlsx_from_ole(data):
 
 
 def extract_ole_objects(docx_path, assets_dir, base_name):
-    """从docx中提取OLE嵌入对象"""
+    """从docx中提取OLE嵌入对象（按需创建目录）"""
     ole_info = {}  # image_name -> {'original_name': str, 'saved_name': str, 'is_image': bool, 'image_idx': int}
     image_idx = 1  # 图片编号计数器
 
+    # 目录路径（按需创建）
     images_dir = assets_dir / "images"
     attachments_dir = assets_dir / "attachments"
 
@@ -301,9 +302,10 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                 # 清理文件名中的特殊字符，用于保存
                 safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', original_name)
 
-                # 保存到对应目录
+                # 保存到对应目录（按需创建）
                 if is_image:
                     # 图片统一编号放入images文件夹，使用简短命名
+                    images_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
                     numbered_name = f"image_{image_idx}.png"
                     save_path = images_dir / numbered_name
                     save_path.write_bytes(embedded_data)
@@ -316,6 +318,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     }
                     image_idx += 1
                 else:
+                    attachments_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
                     save_path = attachments_dir / safe_name
                     save_path.write_bytes(embedded_data)
                     print(f"提取附件: {original_name}")
@@ -328,6 +331,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
     # 处理Excel的md文件生成（在ole_info中检查是否有Excel特殊记录）
     for image_name, info in list(ole_info.items()):
         if 'xlsx_data' in info:  # 这是Excel的特殊记录
+            attachments_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
             # 保存xlsx文件
             xlsx_safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', info['xlsx_name'])
             xlsx_path = attachments_dir / xlsx_safe_name
@@ -439,15 +443,10 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
     base_name = docx_path.stem
 
-    # 创建统一资源文件夹: test3_files/
+    # 资源文件夹路径（按需创建）
     assets_dir = output_dir / f"{base_name}_files"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-
-    # 创建子文件夹
     images_dir = assets_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
     attachments_dir = assets_dir / "attachments"
-    attachments_dir.mkdir(parents=True, exist_ok=True)
 
     # 先提取OLE嵌入对象，返回ole信息和下一个图片编号
     ole_info, next_image_idx = extract_ole_objects(docx_path, assets_dir, base_name)
@@ -475,10 +474,13 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
     extracted_media_path = temp_media_dir / "media"
 
+    # 初始化变量（防止分支未执行时报错）
+    image_map = {}
+    ole_replacements = {}
+    idx = next_image_idx
+
     if extracted_media_path.exists():
         image_files = sorted(extracted_media_path.iterdir())
-        image_map = {}
-        ole_replacements = {}  # OLE对象占位符映射
         idx = next_image_idx  # 继续OLE图片的编号
 
         for img_file in image_files:
@@ -489,6 +491,7 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
                     continue
 
                 # 普通图片，使用简短命名（image_1.png而非长文件名前缀）
+                images_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
                 new_name = f"image_{idx}{img_file.suffix}"
                 new_path = images_dir / new_name
                 shutil.copy2(img_file, new_path)
@@ -799,9 +802,17 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
     print(f"\n转换完成!")
     print(f"MD文件: {md_path}")
-    print(f"资源目录: {assets_dir}")
-    print(f"  - 图片: {images_dir}")
-    print(f"  - 附件: {attachments_dir}")
+
+    # 只在存在资源目录时才显示
+    has_images = images_dir.exists() and any(images_dir.iterdir())
+    has_attachments = attachments_dir.exists() and any(attachments_dir.iterdir())
+
+    if has_images or has_attachments:
+        print(f"资源目录: {assets_dir}")
+        if has_images:
+            print(f"  - 图片: {images_dir}")
+        if has_attachments:
+            print(f"  - 附件: {attachments_dir}")
 
     return str(md_path)
 
