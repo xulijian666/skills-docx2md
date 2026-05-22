@@ -266,17 +266,12 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                             for sheet_name in sheet_names:
                                 ws = wb_source[sheet_name]
                                 md_content += f"## {sheet_name}\n\n"
-                                for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
-                                    if any(cell is not None for cell in row):
-                                        cells = [str(cell) if cell is not None else '' for cell in row]
-                                        md_content += "| " + " | ".join(cells) + " |\n"
-                                        if row_idx == 0:
-                                            md_content += "| " + " | ".join(["---"] * len(cells)) + " |\n"
+                                md_content += _worksheet_to_md(ws)
                                 md_content += "\n"
                             wb_source.close()
 
-                            md_name = Path(original_name).stem + '.md'
-                            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', original_name)
+                            md_name = f'{base_name}_{Path(original_name).stem}.md'
+                            safe_name = f'{base_name}_{re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", original_name)}'
 
                             attachments_dir.mkdir(parents=True, exist_ok=True)
                             att_path = attachments_dir / safe_name
@@ -333,16 +328,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                         for sheet_name in sheet_names:
                             ws = wb_source[sheet_name]
                             md_content += f"## {sheet_name}\n\n"
-
-                            # 读取数据转为表格格式
-                            for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
-                                # 过滤空行
-                                if any(cell is not None for cell in row):
-                                    cells = [str(cell) if cell is not None else '' for cell in row]
-                                    md_content += "| " + " | ".join(cells) + " |\n"
-                                    # 第一行添加表头分隔线
-                                    if row_idx == 0:
-                                        md_content += "| " + " | ".join(["---"] * len(cells)) + " |\n"
+                            md_content += _worksheet_to_md(ws)
                             md_content += "\n"
 
                         wb_source.close()
@@ -389,7 +375,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
 
             if original_name and embedded_data and image_name:
                 # 清理文件名中的特殊字符，用于保存
-                safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', original_name)
+                safe_name = f'{base_name}_{re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", original_name)}'
 
                 # 保存到对应目录（按需创建）
                 if is_image:
@@ -419,7 +405,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     if name_lower.endswith('.docx'):
                         try:
                             md_content = _convert_docx_bytes_to_md(embedded_data)
-                            md_name = Path(original_name).stem + '.md'
+                            md_name = f'{base_name}_{Path(original_name).stem}.md'
                             (attachments_dir / md_name).write_text(md_content, encoding='utf-8')
                             print(f"生成文本(md): {md_name}")
                         except Exception as e:
@@ -427,7 +413,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     elif name_lower.endswith('.doc'):
                         try:
                             md_content = _convert_doc_bytes_to_md(embedded_data, original_name)
-                            md_name = Path(original_name).stem + '.md'
+                            md_name = f'{base_name}_{Path(original_name).stem}.md'
                             (attachments_dir / md_name).write_text(md_content, encoding='utf-8')
                             print(f"生成文本(md): {md_name}")
                         except Exception as e:
@@ -446,21 +432,23 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
     for image_name, info in list(ole_info.items()):
         if 'xlsx_data' in info:  # 这是Excel的特殊记录
             attachments_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
-            # 保存xlsx文件
-            xlsx_safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', info['xlsx_name'])
+            # 保存xlsx文件（加主文件名前缀）
+            original_xlsx = info['xlsx_name']
+            xlsx_safe_name = f'{base_name}_{re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", original_xlsx)}'
             xlsx_path = attachments_dir / xlsx_safe_name
             xlsx_path.write_bytes(info['xlsx_data'])
-            print(f"提取附件(xlsx): {info['xlsx_name']}")
+            print(f"提取附件(xlsx): {original_xlsx} -> {xlsx_safe_name}")
 
-            # 保存md文件
-            md_safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', info['md_name'])
+            # 保存md文件（加主文件名前缀）
+            original_md = info['md_name']
+            md_safe_name = f'{base_name}_{re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", original_md)}'
             md_path = attachments_dir / md_safe_name
             md_path.write_text(info['md_content'], encoding='utf-8')
-            print(f"生成文本(md): {info['md_name']}")
+            print(f"生成文本(md): {original_md} -> {md_safe_name}")
 
             # 更新ole_info为标准格式
             ole_info[image_name] = {
-                'original_name': info['xlsx_name'],
+                'original_name': original_xlsx,
                 'saved_name': xlsx_safe_name,
                 'md_name': md_safe_name,
                 'is_image': False,
@@ -468,6 +456,38 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
             }
 
     return ole_info, image_idx
+
+
+def _worksheet_to_md(ws) -> str:
+    """将openpyxl worksheet转为markdown表格，自动裁剪空行空列"""
+    all_rows = list(ws.iter_rows(values_only=True))
+
+    # 过滤全空行
+    all_rows = [row for row in all_rows if any(cell is not None for cell in row)]
+    if not all_rows:
+        return ""
+
+    # 裁剪空的首列
+    while all_rows and all(row and row[0] is None for row in all_rows):
+        all_rows = [row[1:] for row in all_rows if len(row) > 1]
+        if not any(all_rows):
+            return ""
+
+    # 裁剪空的尾列
+    while all_rows and all(row and row[-1] is None for row in all_rows):
+        all_rows = [row[:-1] for row in all_rows if len(row) > 1]
+        if not any(all_rows):
+            return ""
+
+    result = ""
+    for row_idx, row in enumerate(all_rows):
+        if not row:
+            continue
+        cells = [str(cell).replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ') if cell is not None else '' for cell in row]
+        result += "| " + " | ".join(cells) + " |\n"
+        if row_idx == 0:
+            result += "| " + " | ".join(["---"] * len(cells)) + " |\n"
+    return result
 
 
 def xlsx_to_md(xlsx_path: str, output_dir: str = None) -> str:
@@ -506,19 +526,7 @@ def xlsx_to_md(xlsx_path: str, output_dir: str = None) -> str:
         for sheet_name in sheet_names:
             ws = wb[sheet_name]
             md_content += f"## {sheet_name}\n\n"
-
-            # 读取数据转为表格格式
-            row_count = 0
-            for row in ws.iter_rows(values_only=True):
-                # 过滤全空行
-                if any(cell is not None for cell in row):
-                    cells = [str(cell) if cell is not None else '' for cell in row]
-                    md_content += "| " + " | ".join(cells) + " |\n"
-                    # 第一行添加表头分隔线
-                    if row_count == 0:
-                        md_content += "| " + " | ".join(["---"] * len(cells)) + " |\n"
-                    row_count += 1
-
+            md_content += _worksheet_to_md(ws)
             md_content += "\n"
 
         wb.close()
@@ -679,11 +687,28 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
                 # 普通图片，使用简短命名（image_1.png而非长文件名前缀）
                 images_dir.mkdir(parents=True, exist_ok=True)  # 按需创建
-                new_name = f"image_{idx}{img_file.suffix}"
-                new_path = images_dir / new_name
-                shutil.copy2(img_file, new_path)
-                image_map[img_file.name] = new_name
-                print(f"图片重命名: {img_file.name} -> {new_name}")
+                # EMF格式转为PNG（Markdown/Obsidian不支持EMF预览）
+                if img_file.suffix.lower() == '.emf':
+                    try:
+                        from PIL import Image
+                        img = Image.open(img_file)
+                        new_name = f"image_{idx}.png"
+                        new_path = images_dir / new_name
+                        img.save(new_path, format='PNG')
+                        image_map[img_file.name] = new_name
+                        print(f"EMF转PNG: {img_file.name} -> {new_name}")
+                    except Exception as e:
+                        print(f"EMF转PNG失败({img_file.name}): {e}")
+                        new_name = f"image_{idx}{img_file.suffix}"
+                        new_path = images_dir / new_name
+                        shutil.copy2(img_file, new_path)
+                        image_map[img_file.name] = new_name
+                else:
+                    new_name = f"image_{idx}{img_file.suffix}"
+                    new_path = images_dir / new_name
+                    shutil.copy2(img_file, new_path)
+                    image_map[img_file.name] = new_name
+                    print(f"图片重命名: {img_file.name} -> {new_name}")
                 idx += 1
 
         # 处理OLE对象（图片和附件），需要处理同一行多个OLE的情况
@@ -720,14 +745,17 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
                     )
                     if info.get('has_md'):
                         md_name = info.get('md_name')
+                        md_stem = Path(md_name).stem
+                        # Obsidian双链：有md则链向md文本
                         ole_replacements[placeholder] = {
                             'type': 'attachment',
-                            'link': f'[📎 {original_name}]({base_name}_files/attachments/{saved_name}) [📄 纯文本]({base_name}_files/attachments/{md_name})'
+                            'link': f'[[{md_stem}]]'
                         }
                     else:
+                        # 无md的附件（如Visio），不生成双链，直接移除占位符
                         ole_replacements[placeholder] = {
                             'type': 'attachment',
-                            'link': f'[📎 {original_name}]({base_name}_files/attachments/{saved_name})'
+                            'link': ''
                         }
                     print(f"OLE附件标记: {original_name}")
 
@@ -807,8 +835,8 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
                     new_parts.append(f"**{info['title']}**")
                     new_parts.append(f"![]({info['path']})")
                 else:
-                    # 附件：链接
-                    new_parts.append(info['link'])
+                    # 附件wikilink：前后空行，确保Obsidian能正确识别
+                    new_parts.append(f"\n{info['link']}\n")
 
             # 检查占位符后面是否还有内容
             last_placeholder_end = 0
@@ -965,21 +993,24 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
     content = '\n'.join(result_lines)
 
-    # 更新目录链接格式（去掉页码部分）
+    # 更新目录链接格式：转为Obsidian兼容的heading link
     lines = content.split('\n')
     result_lines = []
 
     for line in lines:
-        # 处理目录链接：[N 标题 [页码](#锚点)](#锚点) -> [N 标题](#锚点)
+        # 处理目录链接：[N 标题 [页码](#锚点)](#锚点) -> [[#N 标题]]
         toc_match = re.match(r'^\[([\d\.\s]+)([^\[]+)\s+\[[^\]]+\]\(#([^)]+)\)\]\(#([^)]+)\)', line)
         if toc_match:
             number_part = toc_match.group(1).strip()
             title_part = toc_match.group(2).strip()
-            # 生成锚点：序号-标题，点号用-连接
-            anchor_number = re.sub(r'\.', '-', number_part)
-            anchor = f'{anchor_number}-{title_part}'.lower()
-            # 保留锚点链接（Markdown标题会自动生成锚点）
-            line = f'[{number_part} {title_part}](#{anchor})'
+            # Obsidian heading link
+            line = f'[[#{number_part} {title_part}]]'
+        # 也处理已简化但仍是锚点格式的链接：[N 标题](#锚点) -> [[#N 标题]]
+        elif re.match(r'^\[[\d\.\s]+[^\]]+\]\(#[^)]+\)$', line.strip()):
+            simple_match = re.match(r'^\[([^\]]+)\]\(#([^)]+)\)$', line.strip())
+            if simple_match:
+                link_text = simple_match.group(1).strip()
+                line = f'[[#{link_text}]]'
 
         result_lines.append(line)
 
