@@ -139,6 +139,51 @@ def extract_xlsx_from_ole(data):
         return None
 
 
+def _convert_docx_bytes_to_md(data: bytes) -> str:
+    """将docx字节数据通过pandoc转为markdown文本"""
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        cmd = ["pandoc", tmp_path, "-f", "docx", "-t", "gfm", "--wrap=none"]
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8")
+        if result.returncode != 0:
+            raise RuntimeError(f"pandoc失败: {result.stderr}")
+        return result.stdout
+    finally:
+        os.unlink(tmp_path)
+
+
+def _convert_doc_bytes_to_md(data: bytes, original_name: str) -> str:
+    """将doc字节数据转为markdown：先用Word COM转docx，再用pandoc转md"""
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="docx2md_att_")
+    tmp_doc = str(Path(tmp_dir) / original_name)
+    tmp_docx = str(Path(tmp_dir) / (Path(original_name).stem + ".docx"))
+    try:
+        with open(tmp_doc, 'wb') as f:
+            f.write(data)
+
+        try:
+            import win32com.client
+        except ImportError:
+            raise RuntimeError("转换.doc附件需要pywin32库")
+
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        try:
+            doc = word.Documents.Open(tmp_doc)
+            doc.SaveAs(tmp_docx, FileFormat=16)
+            doc.Close()
+        finally:
+            word.Quit()
+
+        return _convert_docx_bytes_to_md(open(tmp_docx, 'rb').read())
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def extract_ole_objects(docx_path, assets_dir, base_name):
     """从docx中提取OLE嵌入对象（按需创建目录）"""
     ole_info = {}  # image_name -> {'original_name': str, 'saved_name': str, 'is_image': bool, 'image_idx': int}
@@ -206,11 +251,55 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
 
             if prog_id == 'Package':
                 original_name, embedded_data = get_ole10native_filename(ole_data)
-                # 检查是否是图片文件
-                if original_name and original_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                    is_image = True
-                else:
-                    is_image = False
+                if original_name:
+                    name_lower = original_name.lower()
+                    # 检查是否是图片文件
+                    if name_lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                        is_image = True
+                    # 检查是否是Excel文件，转为md
+                    elif name_lower.endswith(('.xlsx', '.xls')) and embedded_data:
+                        try:
+                            wb_source = load_workbook(io.BytesIO(embedded_data), data_only=True)
+                            sheet_names = wb_source.sheetnames
+
+                            md_content = ""
+                            for sheet_name in sheet_names:
+                                ws = wb_source[sheet_name]
+                                md_content += f"## {sheet_name}\n\n"
+                                for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                                    if any(cell is not None for cell in row):
+                                        cells = [str(cell) if cell is not None else '' for cell in row]
+                                        md_content += "| " + " | ".join(cells) + " |\n"
+                                        if row_idx == 0:
+                                            md_content += "| " + " | ".join(["---"] * len(cells)) + " |\n"
+                                md_content += "\n"
+                            wb_source.close()
+
+                            md_name = Path(original_name).stem + '.md'
+                            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', original_name)
+
+                            attachments_dir.mkdir(parents=True, exist_ok=True)
+                            att_path = attachments_dir / safe_name
+                            att_path.write_bytes(embedded_data)
+                            md_path = attachments_dir / md_name
+                            md_path.write_text(md_content, encoding='utf-8')
+
+                            print(f"提取附件(xlsx): {original_name}")
+                            print(f"生成文本(md): {md_name}")
+
+                            ole_info[image_name] = {
+                                'original_name': original_name,
+                                'saved_name': safe_name,
+                                'md_name': md_name,
+                                'is_image': False,
+                                'has_md': True
+                            }
+                            continue
+                        except Exception as e:
+                            print(f"附件Excel处理失败({original_name}): {e}")
+                            is_image = False
+                    else:
+                        is_image = False
             elif prog_id == 'Excel.Sheet.12':
                 xlsx_data = extract_xlsx_from_ole(ole_data)
                 if xlsx_data:
@@ -322,11 +411,36 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     save_path = attachments_dir / safe_name
                     save_path.write_bytes(embedded_data)
                     print(f"提取附件: {original_name}")
+
+                    md_name = None
+                    name_lower = original_name.lower()
+
+                    # 对doc/docx附件自动转为md
+                    if name_lower.endswith('.docx'):
+                        try:
+                            md_content = _convert_docx_bytes_to_md(embedded_data)
+                            md_name = Path(original_name).stem + '.md'
+                            (attachments_dir / md_name).write_text(md_content, encoding='utf-8')
+                            print(f"生成文本(md): {md_name}")
+                        except Exception as e:
+                            print(f"附件docx转md失败({original_name}): {e}")
+                    elif name_lower.endswith('.doc'):
+                        try:
+                            md_content = _convert_doc_bytes_to_md(embedded_data, original_name)
+                            md_name = Path(original_name).stem + '.md'
+                            (attachments_dir / md_name).write_text(md_content, encoding='utf-8')
+                            print(f"生成文本(md): {md_name}")
+                        except Exception as e:
+                            print(f"附件doc转md失败({original_name}): {e}")
+
                     ole_info[image_name] = {
                         'original_name': original_name,
                         'saved_name': safe_name,
-                        'is_image': False
+                        'is_image': False,
                     }
+                    if md_name:
+                        ole_info[image_name]['md_name'] = md_name
+                        ole_info[image_name]['has_md'] = True
 
     # 处理Excel的md文件生成（在ole_info中检查是否有Excel特殊记录）
     for image_name, info in list(ole_info.items()):
@@ -418,6 +532,79 @@ def xlsx_to_md(xlsx_path: str, output_dir: str = None) -> str:
 
     except Exception as e:
         raise RuntimeError(f"Excel转换失败: {e}")
+
+
+def pdf_to_md(pdf_path: str, output_dir: str = None) -> str:
+    """
+    将PDF文件转换为markdown格式，使用MarkItDown提取文本 + 正则后处理识别结构
+
+    Args:
+        pdf_path: PDF文件路径
+        output_dir: 输出目录，默认为PDF文件所在目录
+
+    Returns:
+        生成的md文件路径
+    """
+    from markitdown import MarkItDown
+
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"文件不存在: {pdf_path}")
+
+    if output_dir is None:
+        output_dir = pdf_path.parent
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_name = pdf_path.stem
+    md_path = output_dir / f"{base_name}.md"
+
+    print(f"处理PDF文件: {pdf_path}")
+
+    # MarkItDown提取文本
+    m = MarkItDown()
+    result = m.convert(str(pdf_path))
+    text = result.text_content
+
+    # 正则后处理：识别文档结构，转为markdown标题
+    lines = text.split('\n')
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            new_lines.append('')
+            continue
+
+        # 第X章 -> #
+        if re.match(r'^第[一二三四五六七八九十百零\d]+章', stripped):
+            new_lines.append(f'# {stripped}')
+        # 第X条 -> ##
+        elif re.match(r'^第[一二三四五六七八九十百零\d]+条', stripped):
+            new_lines.append(f'## {stripped}')
+        # 一、二、三、...的短子项 -> ###
+        elif re.match(r'^[一二三四五六七八九十]+、', stripped) and len(stripped) < 60:
+            new_lines.append(f'### {stripped}')
+        # （一）（二）...的短子项 -> ####
+        elif re.match(r'^（[一二三四五六七八九十]+）', stripped) and len(stripped) < 60:
+            new_lines.append(f'#### {stripped}')
+        else:
+            new_lines.append(stripped)
+
+    text = '\n'.join(new_lines)
+
+    # 去掉孤立的页码行（单独的数字）
+    text = re.sub(r'\n\d+\n', '\n', text)
+    # 清理多余空行
+    while '\n\n\n' in text:
+        text = text.replace('\n\n\n', '\n\n')
+
+    md_path.write_text(text, encoding="utf-8")
+
+    print(f"转换完成!")
+    print(f"MD文件: {md_path}")
+
+    return str(md_path)
 
 
 def docx_to_md(docx_path: str, output_dir: str = None) -> str:
@@ -817,6 +1004,51 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
     return str(md_path)
 
 
+def doc_to_docx(doc_path: str) -> str:
+    """将旧格式.doc转换为.docx，使用Word COM自动化，返回临时docx路径"""
+    import atexit
+    import tempfile
+
+    doc_path = str(Path(doc_path).resolve())
+    tmp_dir = tempfile.mkdtemp(prefix="docx2md_")
+    tmp_docx = str(Path(tmp_dir) / (Path(doc_path).stem + ".docx"))
+
+    try:
+        import win32com.client
+    except ImportError:
+        raise RuntimeError(
+            "转换.doc需要pywin32库，请运行: pip install pywin32\n"
+            "或者安装LibreOffice并在PATH中可用"
+        )
+
+    print(f"将.doc转换为.docx: {Path(doc_path).name}")
+    word = win32com.client.Dispatch("Word.Application")
+    word.Visible = False
+
+    def cleanup():
+        try:
+            word.Quit()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    atexit.register(cleanup)
+
+    try:
+        doc = word.Documents.Open(doc_path)
+        doc.SaveAs(tmp_docx, FileFormat=16)  # 16 = wdFormatXMLDocument (.docx)
+        doc.Close()
+    except Exception as e:
+        cleanup()
+        raise RuntimeError(f".doc转.docx失败: {e}")
+
+    print(f"转换完成: {tmp_docx}")
+    return tmp_docx
+
+
 def main():
     import sys
     import argparse
@@ -826,8 +1058,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 支持格式:
-  - docx: Word文档，提取图片和OLE附件
+  - doc/docx: Word文档，提取图片和OLE附件
   - xlsx/xls: Excel文件，转换为markdown表格
+  - pdf: PDF文档，提取文本、表格和图片
 
 输出结构:
   docx: {filename}.md + {filename}_files/images/ + {filename}_files/attachments/
@@ -835,11 +1068,12 @@ def main():
 
 示例:
   python docx2md.py document.docx
+  python docx2md.py document.doc
   python docx2md.py spreadsheet.xlsx
   python docx2md.py document.docx -o ./output
         '''
     )
-    parser.add_argument('input_file', help='要转换的文件路径 (docx/xlsx/xls)')
+    parser.add_argument('input_file', help='要转换的文件路径 (doc/docx/xlsx/xls)')
     parser.add_argument('-o', '--output', help='输出目录（默认为输入文件所在目录）')
 
     args = parser.parse_args()
@@ -852,9 +1086,25 @@ def main():
             md_path = xlsx_to_md(args.input_file, args.output)
         elif suffix == '.docx':
             md_path = docx_to_md(args.input_file, args.output)
+        elif suffix == '.doc':
+            docx_path = doc_to_docx(args.input_file)
+            # .doc转换时，输出目录取原文件所在目录（除非用户指定了-o）
+            doc_output = args.output if args.output else str(input_path.parent)
+            try:
+                md_path = docx_to_md(docx_path, doc_output)
+            finally:
+                # 清理临时docx和临时目录
+                tmp_dir = str(Path(docx_path).parent)
+                try:
+                    os.remove(docx_path)
+                    os.rmdir(tmp_dir)
+                except Exception:
+                    pass
+        elif suffix == '.pdf':
+            md_path = pdf_to_md(args.input_file, args.output)
         else:
             print(f"不支持的文件格式: {suffix}")
-            print("支持的格式: .docx, .xlsx, .xls")
+            print("支持的格式: .doc, .docx, .xlsx, .xls, .pdf")
             sys.exit(1)
 
         print(f"\n转换成功!")
@@ -865,10 +1115,6 @@ def main():
     except RuntimeError as e:
         print(f"转换失败: {e}")
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
