@@ -139,23 +139,61 @@ def extract_xlsx_from_ole(data):
         return None
 
 
-def _convert_docx_bytes_to_md(data: bytes) -> str:
-    """将docx字节数据通过pandoc转为markdown文本"""
+def _convert_docx_bytes_to_md(data: bytes, parent_images_dir=None, parent_attachments_dir=None, next_img_idx=1):
+    """将docx字节数据转为markdown，支持递归提取嵌套OLE附件
+
+    Args:
+        data: docx文件字节数据
+        parent_images_dir: 父级images目录（用于合并子文档图片）
+        parent_attachments_dir: 父级attachments目录（用于合并子文档附件）
+        next_img_idx: 图片起始编号
+
+    Returns:
+        (md_text, next_img_idx): markdown文本和下一个可用图片编号
+    """
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
+    tmp_dir = tempfile.mkdtemp(prefix="docx2md_nested_")
     try:
-        cmd = ["pandoc", tmp_path, "-f", "docx", "-t", "gfm", "--wrap=none"]
-        result = subprocess.run(cmd, capture_output=True, encoding="utf-8")
-        if result.returncode != 0:
-            raise RuntimeError(f"pandoc失败: {result.stderr}")
-        text = result.stdout
-        # 清理pandoc生成的media引用（嵌入docx的图片未实际提取，引用是坏的）
-        text = re.sub(r'!\[[^\]]*\]\(media/[^)]+\)\s*', '', text)
-        return text
+        tmp_docx = os.path.join(tmp_dir, "att.docx")
+        with open(tmp_docx, 'wb') as f:
+            f.write(data)
+
+        # 走完整的docx_to_md流程（含OLE提取、图片处理）
+        md_path = docx_to_md(tmp_docx, tmp_dir)
+        md_text = Path(md_path).read_text(encoding='utf-8')
+
+        stem = Path(tmp_docx).stem
+        child_images_dir = Path(tmp_dir) / f"{stem}_files" / "images"
+        child_attachments_dir = Path(tmp_dir) / f"{stem}_files" / "attachments"
+
+        # 合并图片到父级目录
+        if parent_images_dir and child_images_dir.exists():
+            parent_images_dir.mkdir(parents=True, exist_ok=True)
+            for img_file in sorted(child_images_dir.iterdir()):
+                if img_file.is_file():
+                    new_name = f"image_{next_img_idx}{img_file.suffix}"
+                    shutil.copy2(img_file, parent_images_dir / new_name)
+                    md_text = md_text.replace(
+                        f"![]({stem}_files/images/{img_file.name})",
+                        f"![]({Path(parent_images_dir).parent.name}/images/{new_name})"
+                    )
+                    next_img_idx += 1
+
+        # 合并附件到父级目录
+        if parent_attachments_dir and child_attachments_dir.exists():
+            parent_attachments_dir.mkdir(parents=True, exist_ok=True)
+            for att_file in child_attachments_dir.iterdir():
+                if att_file.is_file():
+                    shutil.copy2(att_file, parent_attachments_dir / att_file.name)
+
+        # 修正嵌套文档中的双链路径：att_files/attachments/ → 父级实际路径
+        if parent_attachments_dir:
+            parent_prefix = f"{Path(parent_attachments_dir).parent.name}/attachments/"
+            md_text = md_text.replace(f"{stem}_files/attachments/", parent_prefix)
+
+        return md_text, next_img_idx
     finally:
-        os.unlink(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _convert_doc_bytes_to_md(data: bytes, original_name: str) -> str:
@@ -299,7 +337,9 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     # 检查是否是Word文件，转为md
                     elif name_lower.endswith('.docx') and embedded_data:
                         try:
-                            md_content = _convert_docx_bytes_to_md(embedded_data)
+                            md_content, image_idx = _convert_docx_bytes_to_md(
+                                embedded_data, images_dir, attachments_dir, image_idx
+                            )
                             md_name = f'{Path(original_name).stem}.md'
                             safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", original_name)
 
@@ -445,7 +485,11 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                             texts = re.findall(r'<w:t[^>]*>([^<]+)</w:t>', doc_xml_inner)
                             if texts and len(texts[0]) > 1:
                                 real_name = texts[0].strip()
-                        md_content = _convert_docx_bytes_to_md(docx_data)
+
+                        # 递归转换：走完整docx_to_md流程（含嵌套OLE提取）
+                        md_content, image_idx = _convert_docx_bytes_to_md(
+                            docx_data, images_dir, attachments_dir, image_idx
+                        )
 
                         ole_info[image_name] = {
                             'original_name': f'{real_name}.docx',
@@ -455,7 +499,7 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                             'is_image': False,
                             'has_md': True
                         }
-                        print(f"Word嵌入对象提取: {real_name}.docx")
+                        print(f"Word嵌入对象提取(递归): {real_name}.docx")
                         continue
                     except Exception as e:
                         print(f"Word嵌入处理失败(附件{ole_num}): {e}")
@@ -508,10 +552,12 @@ def extract_ole_objects(docx_path, assets_dir, base_name):
                     md_name = None
                     name_lower = original_name.lower()
 
-                    # 对doc/docx附件自动转为md
+                    # 对doc/docx附件自动转为md（递归提取嵌套附件）
                     if name_lower.endswith('.docx'):
                         try:
-                            md_content = _convert_docx_bytes_to_md(embedded_data)
+                            md_content, image_idx = _convert_docx_bytes_to_md(
+                                embedded_data, images_dir, attachments_dir, image_idx
+                            )
                             md_name = f'{Path(original_name).stem}.md'
                             (attachments_dir / md_name).write_text(md_content, encoding='utf-8')
                             print(f"生成文本(md): {md_name}")
@@ -803,6 +849,22 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
 
     content = result.stdout
 
+    # 修复pandoc转义的mermaid代码块
+    def _unescape_mermaid(m):
+        inner = m.group(1)
+        inner = inner.replace('\\`', '`').replace('\\[', '[').replace('\\]', ']')
+        inner = inner.replace('\\{', '{').replace('\\}', '}')
+        inner = inner.replace('\\|', '|').replace('\\>', '>').replace('\\<', '<')
+        inner = inner.replace('\\(', '(').replace('\\)', ')')
+        inner = inner.replace('\\_', '_').replace('\\#', '#')
+        inner = inner.replace('\\-', '-').replace('\\+', '+')
+        inner = inner.replace('\\=', '=').replace('\\.', '.')
+        inner = inner.replace('\\\\\n', '\n').replace('\\\n', '\n')
+        inner = inner.replace('\\\\', '\\')
+        return f'```mermaid\n{inner}\n```'
+
+    content = re.sub(r'\\`\\`\\`mermaid\\?\n(.*?)\\`\\`\\`', _unescape_mermaid, content, flags=re.DOTALL)
+
     extracted_media_path = temp_media_dir / "media"
 
     # 初始化变量（防止分支未执行时报错）
@@ -1012,8 +1074,7 @@ def docx_to_md(docx_path: str, output_dir: str = None) -> str:
                         if i + 1 < len(lines):
                             next_line = lines[i + 1]
                             next_cells = [c.strip() for c in next_line.split('|') if c.strip()]
-                            all_bold = all(re.match(r'^\*\*[^*]+\*\*$', c) for c in next_cells)
-                            if all_bold and next_cells:
+                            if next_cells:
                                 new_lines.pop()
                                 new_lines.append(next_line)
                                 new_lines.append(line)
